@@ -496,6 +496,22 @@ class WorkTracker:
                 self.conn.execute(f'ALTER TABLE todos ADD COLUMN {name} {definition}')
         self.conn.execute('CREATE INDEX IF NOT EXISTS idx_work_date ON work_logs(date, created_at, id)')
         self.conn.execute('CREATE INDEX IF NOT EXISTS idx_todos_status ON todos(status, created_at, id)')
+        # 循环提醒表：与 work_logs / todos 完全独立，新增时绝不触碰老数据。
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS reminders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                rule TEXT NOT NULL,
+                next_fire TEXT,
+                fire_time TEXT DEFAULT '09:00',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                weekend_skip INTEGER NOT NULL DEFAULT 0,
+                fired_count INTEGER NOT NULL DEFAULT 0,
+                last_fired TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        self.conn.execute('CREATE INDEX IF NOT EXISTS idx_reminders_next ON reminders(next_fire, enabled)')
         self.conn.commit()
 
     def due_reminders(self, now=None):
@@ -546,6 +562,260 @@ class WorkTracker:
                  action == 'disable', action == 'complete', action == 'complete', now.isoformat(), record_id)
             )
         return until
+
+    # -------------------------------------------------------------- 循环提醒规则引擎
+    @staticmethod
+    def compute_next_fire(rule, from_date, weekend_skip=False):
+        """按 rule 计算 from_date 之后（含当天）最近的一次触发日期。
+
+        rule 是 dict，支持的 kind：
+          once     {kind:'once', date:'2026-12-25'}
+          yearly   {kind:'yearly', month:3, day:15}
+          monthly  {kind:'monthly', every:2, day:15}
+          weekly   {kind:'weekly', every:2, weekday:4}   # weekday: 0=周一 .. 6=周日
+          countdown {kind:'countdown', target:'2027-06-07'}
+        weekend_skip=True 时，如果算出来是周六/周日，顺延到下一个周一。
+        返回 date 对象；如果规则已终止（countdown 过了 target / once 已过）返回 None。
+        """
+        import json as _json
+        if isinstance(rule, str):
+            try:
+                rule = _json.loads(rule)
+            except _json.JSONDecodeError:
+                return None
+        kind = rule.get('kind')
+        today = from_date if isinstance(from_date, date) else from_date.date()
+
+        def _skip_weekend(d):
+            if weekend_skip and d.weekday() >= 5:
+                # 周六 (5) 顺延 +2 到周一；周日 (6) 顺延 +1 到周一
+                d = d + timedelta(days=7 - d.weekday())
+            return d
+
+        if kind == 'once':
+            d = WorkTracker.parse_date_input(rule.get('date'))
+            if d is None:
+                return None
+            return _skip_weekend(d) if d >= today else None
+
+        if kind == 'yearly':
+            month = int(rule.get('month', 1))
+            day = int(rule.get('day', 1))
+            for year in (today.year, today.year + 1):
+                try:
+                    d = date(year, month, day)
+                except ValueError:
+                    continue
+                if d >= today:
+                    return _skip_weekend(d)
+            return None
+
+        if kind == 'monthly':
+            every = max(1, int(rule.get('every', 1)))
+            day = max(1, min(31, int(rule.get('day', 1))))
+            # 从本月份开始试，找到第一个 >= today 的
+            year, month = today.year, today.month
+            for _ in range(24):  # 最多往后推 24 个月，防止死循环
+                try:
+                    import calendar as _cal
+                    last = _cal.monthrange(year, month)[1]
+                    dd = min(day, last)
+                    d = date(year, month, dd)
+                except ValueError:
+                    break
+                if d >= today:
+                    return _skip_weekend(d)
+                month += every
+                while month > 12:
+                    month -= 12
+                    year += 1
+            return None
+
+        if kind == 'weekly':
+            every = max(1, int(rule.get('every', 1)))
+            weekdays = rule.get('weekdays')
+            if weekdays is None:
+                weekdays = [int(rule.get('weekday', 0))]  # 兼容旧格式
+            weekdays = sorted({int(w) for w in weekdays if 0 <= int(w) <= 6})
+            if not weekdays:
+                return None
+            # 参考周锚点：今天所在周的周一；every=1 所有周都触发，every=N 则每隔 N-1 周触发
+            monday_ref = today - timedelta(days=today.weekday())
+            candidate = today
+            # 安全上限：往后推 2 年
+            for _ in range(366 * 2):
+                if candidate.weekday() in weekdays:
+                    week_diff = (candidate - monday_ref).days // 7
+                    if week_diff >= 0 and week_diff % every == 0:
+                        return _skip_weekend(candidate)
+                candidate += timedelta(days=1)
+            return None
+
+        if kind == 'countdown':
+            target = WorkTracker.parse_date_input(rule.get('target'))
+            if target is None:
+                return None
+            if today > target:
+                return None  # 已过倒数终点，自动停用
+            return _skip_weekend(today)  # 每天都触发（只要还没到 target 之后）
+
+        return None  # 未知 kind
+
+    @staticmethod
+    def parse_date_input(text):
+        """同时接受 YYYY.MM.DD 和 YYYY-MM-DD，返回 date 或 None。"""
+        if not text:
+            return None
+        s = str(text).strip().replace('.', '-').replace('/', '-')
+        try:
+            return date.fromisoformat(s)
+        except (ValueError, TypeError):
+            return None
+
+    @staticmethod
+    def describe_rule(rule):
+        """规则 JSON → 人类可读描述（Tab 列表里显示）。"""
+        import json as _json
+        if isinstance(rule, str):
+            try:
+                rule = _json.loads(rule)
+            except _json.JSONDecodeError:
+                return '(规则损坏)'
+        kind = rule.get('kind', '?')
+        if kind == 'once':
+            d = WorkTracker.parse_date_input(rule.get('date'))
+            return f'单次 {d.isoformat() if d else "?"}'
+        if kind == 'yearly':
+            return f'每年 {rule.get("month", "?")}月{rule.get("day", "?")}日'
+        if kind == 'monthly':
+            every = rule.get('every', 1)
+            prefix = '每月' if every == 1 else f'每 {every} 个月'
+            return f'{prefix} {rule.get("day", "?")} 号'
+        if kind == 'weekly':
+            every = rule.get('every', 1)
+            weekdays = rule.get('weekdays')
+            if weekdays is None:
+                weekdays = [rule.get('weekday', 0)]
+            weekdays = sorted({int(w) for w in weekdays if 0 <= int(w) <= 6})
+            names = ['一', '二', '三', '四', '五', '六', '日']
+            weekday_str = '、'.join(f'周{names[w]}' for w in weekdays)
+            prefix = '每周' if every == 1 else f'每 {every} 周'
+            return f'{prefix} {weekday_str}'
+        if kind == 'countdown':
+            tgt = WorkTracker.parse_date_input(rule.get('target'))
+            return f'倒数 到 {tgt.isoformat() if tgt else "?"}'
+        return f'(未知规则 {kind})'
+
+    # ---------- reminders CRUD ----------
+    def list_reminders(self, only_enabled=False):
+        sql = ('SELECT id, title, rule, next_fire, fire_time, enabled, weekend_skip, '
+               'fired_count, last_fired FROM reminders')
+        params = ()
+        if only_enabled:
+            sql += ' WHERE enabled=1 AND next_fire IS NOT NULL'
+        sql += ' ORDER BY enabled DESC, next_fire IS NULL, next_fire ASC, id ASC'
+        return self.conn.execute(sql, params).fetchall()
+
+    def add_reminder(self, title, rule, fire_time='09:00', weekend_skip=False):
+        next_fire = WorkTracker.compute_next_fire(rule, date.today(), weekend_skip)
+        if next_fire is None:
+            raise ValueError('这条规则算不出下一次触发日期，请检查规则是否合理。')
+        import json as _json
+        with self.conn:
+            cur = self.conn.execute(
+                'INSERT INTO reminders (title, rule, next_fire, fire_time, weekend_skip) '
+                'VALUES (?, ?, ?, ?, ?)',
+                (title, _json.dumps(rule, ensure_ascii=False), next_fire.isoformat(),
+                 fire_time, 1 if weekend_skip else 0)
+            )
+            return cur.lastrowid
+
+    def update_reminder(self, record_id, title=None, rule=None, fire_time=None,
+                        weekend_skip=None, enabled=None):
+        cur = self.conn.execute('SELECT rule, weekend_skip FROM reminders WHERE id=?', (record_id,))
+        row = cur.fetchone()
+        if row is None:
+            raise KeyError('提醒不存在。')
+        import json as _json
+        current_rule = _json.loads(row[0])
+        current_skip = bool(row[1])
+        new_rule = rule if rule is not None else current_rule
+        new_skip = weekend_skip if weekend_skip is not None else current_skip
+        next_fire = WorkTracker.compute_next_fire(new_rule, date.today(), new_skip)
+        if rule is not None and next_fire is None:
+            raise ValueError('新规则算不出下一次触发日期。')
+        updates = []
+        params = []
+        if title is not None:
+            updates.append('title=?')
+            params.append(title)
+        if rule is not None:
+            updates.append('rule=?')
+            params.append(_json.dumps(new_rule, ensure_ascii=False))
+        if fire_time is not None:
+            updates.append('fire_time=?')
+            params.append(fire_time)
+        if weekend_skip is not None:
+            updates.append('weekend_skip=?')
+            params.append(1 if weekend_skip else 0)
+        if enabled is not None:
+            updates.append('enabled=?')
+            params.append(1 if enabled else 0)
+        updates.append('next_fire=?')
+        params.append(next_fire.isoformat() if next_fire else None)
+        params.append(record_id)
+        with self.conn:
+            self.conn.execute(f'UPDATE reminders SET {",".join(updates)} WHERE id=?', params)
+
+    def delete_reminder(self, record_id):
+        with self.conn:
+            self.conn.execute('DELETE FROM reminders WHERE id=?', (record_id,))
+
+    def toggle_reminder(self, record_id, enabled):
+        with self.conn:
+            self.conn.execute('UPDATE reminders SET enabled=? WHERE id=?',
+                              (1 if enabled else 0, record_id))
+
+    def consume_due_reminders(self, now=None):
+        """返回今天到期的循环提醒，并把每条的 next_fire 推到下一次。
+
+        返回 [(record_id, title, fire_time_str), ...]
+        """
+        now = now or datetime.now()
+        today_str = now.date().isoformat()
+        rows = self.conn.execute(
+            "SELECT id, title, rule, next_fire, fire_time, weekend_skip, fired_count, last_fired "
+            "FROM reminders WHERE enabled=1 AND next_fire<=?",
+            (today_str,)
+        ).fetchall()
+        due = []
+        with self.conn:
+            for rid, title, rule, nxt, fire_time, skip, fired, last_fired in rows:
+                # countdown 过了 target / once 已过 → 自动停用
+                import json as _json
+                parsed = _json.loads(rule) if isinstance(rule, str) else rule
+                if parsed.get('kind') == 'countdown':
+                    tgt = WorkTracker.parse_date_input(parsed.get('target'))
+                    if tgt and now.date() > tgt:
+                        self.conn.execute('UPDATE reminders SET enabled=0 WHERE id=?', (rid,))
+                        continue
+                if parsed.get('kind') == 'once':
+                    # once 触发后标记停用
+                    self.conn.execute(
+                        'UPDATE reminders SET enabled=0, fired_count=fired_count+1, '
+                        'last_fired=? WHERE id=?',
+                        (now.isoformat(), rid)
+                    )
+                    due.append((rid, title, fire_time or '09:00'))
+                    continue
+                next_next = WorkTracker.compute_next_fire(parsed, now.date() + timedelta(days=1), bool(skip))
+                self.conn.execute(
+                    'UPDATE reminders SET next_fire=?, fired_count=fired_count+1, '
+                    'last_fired=? WHERE id=?',
+                    (next_next.isoformat() if next_next else None, now.isoformat(), rid)
+                )
+                due.append((rid, title, fire_time or '09:00'))
+        return due
 
     # ==================== 工时管理 ====================
 
@@ -826,15 +1096,19 @@ class WorkTrackerApp(tk.Tk):
         tabs.pack(side='top', fill='both', expand=True, padx=10)
         self.work_tab = ttk.Frame(tabs, padding=8)
         self.todo_tab = ttk.Frame(tabs, padding=8)
+        self.reminder_tab = ttk.Frame(tabs, padding=8)
         tabs.add(self.work_tab, text='  工时记录  ')
         tabs.add(self.todo_tab, text='  待办事项  ')
+        tabs.add(self.reminder_tab, text='  🔔 提醒事项  ')
         self._build_work_tab()
         self._build_todo_tab()
+        self._build_reminder_tab()
         self._startup_step('正在统计工时…')
         self.protocol('WM_DELETE_WINDOW', self.on_close)
         self._bind_shortcuts()
         self.refresh_work()
         self.refresh_todos()
+        self.refresh_reminders()
         self.refresh_overview()
         self._startup_step('正在启动托盘…')
         self._start_tray()
@@ -1574,6 +1848,352 @@ class WorkTrackerApp(tk.Tk):
         self.todo_total = tk.StringVar()
         ttk.Label(self.todo_tab, textvariable=self.todo_total, style='Summary.TLabel').pack(anchor='w')
         ttk.Label(self.todo_tab, text='红色表示已过截止日期的未完成任务。').pack(anchor='w', pady=(5, 0))
+
+    def _build_reminder_tab(self):
+        """循环提醒 Tab：列表 + 新建/编辑弹窗入口。"""
+        frame = ttk.Frame(self.reminder_tab)
+        frame.pack(fill='both', expand=True)
+
+        # 顶部工具栏
+        bar = ttk.Frame(frame)
+        bar.pack(fill='x')
+        ttk.Button(bar, text='＋ 新建提醒', command=self.show_reminder_dialog).pack(side='left')
+        ttk.Button(bar, text='✎ 编辑', command=self.edit_selected_reminder).pack(side='left', padx=4)
+        ttk.Button(bar, text='🗑 删除', command=self.delete_selected_reminder).pack(side='left')
+        ttk.Separator(bar, orient='vertical').pack(side='left', fill='y', padx=6)
+        ttk.Button(bar, text='⏸ 暂停', command=lambda: self.toggle_selected_reminder(False)).pack(side='left', padx=(0, 4))
+        ttk.Button(bar, text='▶ 启用', command=lambda: self.toggle_selected_reminder(True)).pack(side='left')
+        ttk.Button(bar, text='立即刷新', command=self.refresh_reminders).pack(side='right')
+
+        # 列表
+        tree_frame = ttk.Frame(frame)
+        tree_frame.pack(fill='both', expand=True, pady=(6, 4))
+        self.reminder_tree = ttk.Treeview(
+            tree_frame,
+            columns=('title', 'rule', 'next_fire', 'time', 'status', 'count'),
+            show='headings', selectmode='browse', height=12,
+        )
+        heads = [('title', '标题', 180), ('rule', '规则', 260),
+                 ('next_fire', '下次触发', 100), ('time', '时间', 60),
+                 ('status', '状态', 70), ('count', '次数', 60)]
+        for col, text, w in heads:
+            self.reminder_tree.heading(col, text=text)
+            self.reminder_tree.column(col, width=w, anchor='w', stretch=(col in ('title', 'rule')))
+        vsb = ttk.Scrollbar(tree_frame, orient='vertical', command=self.reminder_tree.yview)
+        self.reminder_tree.configure(yscrollcommand=vsb.set)
+        vsb.pack(side='right', fill='y')
+        self.reminder_tree.pack(side='left', fill='both', expand=True)
+        self.reminder_tree.tag_configure('enabled', foreground='#166534')
+        self.reminder_tree.tag_configure('disabled', foreground='#9ca3af')
+        self.reminder_tree.tag_configure('overdue', foreground='#b91c1c')
+        self.reminder_tree.bind('<Double-1>', lambda e: self.edit_selected_reminder())
+
+        self.reminder_total = tk.StringVar()
+        ttk.Label(frame, textvariable=self.reminder_total, style='Summary.TLabel').pack(anchor='w')
+
+    def refresh_reminders(self):
+        self.reminder_tree.delete(*self.reminder_tree.get_children())
+        rows = self.tracker.list_reminders()
+        today = date.today()
+        for rid, title, rule, nxt, fire_time, enabled, skip, fired_count, last_fired in rows:
+            try:
+                rule_desc = self.tracker.describe_rule(rule) if isinstance(rule, str) else self.tracker.describe_rule(rule)
+            except Exception:
+                rule_desc = '(规则解析失败)'
+            next_str = nxt.replace('-', '.') if nxt else '—'
+            if nxt:
+                try:
+                    nxt_date = WorkTracker.parse_date_input(nxt)
+                    tag = 'enabled' if enabled else 'disabled'
+                    if enabled and nxt_date and nxt_date < today:
+                        tag = 'overdue'
+                except Exception:
+                    tag = 'disabled'
+            else:
+                tag = 'disabled'
+            status_text = '✔启用' if enabled else '⏸暂停'
+            if not nxt and enabled:
+                status_text = '✔已启用'  # countdown 过 target / once 已过 的 edge case
+            self.reminder_tree.insert('', 'end', iid=str(rid),
+                                      values=(title, rule_desc, next_str, fire_time or '09:00',
+                                              status_text, fired_count),
+                                      tags=(tag,))
+        enabled_count = sum(1 for r in rows if r[5])
+        self.reminder_total.set(f'共 {len(rows)} 条，其中启用 {enabled_count} 条')
+
+    def _selected_reminder_id(self):
+        sel = self.reminder_tree.selection()
+        if not sel:
+            return None
+        try:
+            return int(sel[0])
+        except (ValueError, TypeError):
+            return None
+
+    def edit_selected_reminder(self):
+        rid = self._selected_reminder_id()
+        if rid is None:
+            return
+        cur = self.tracker.conn.execute(
+            'SELECT title, rule, fire_time, enabled, weekend_skip FROM reminders WHERE id=?', (rid,))
+        row = cur.fetchone()
+        if row is None:
+            return
+        import json as _json
+        try:
+            rule_dict = _json.loads(row[1]) if isinstance(row[1], str) else row[1]
+        except Exception:
+            rule_dict = {'kind': 'yearly', 'month': 1, 'day': 1}
+        self.show_reminder_dialog(
+            record_id=rid, initial_title=row[0], initial_rule=rule_dict,
+            initial_fire_time=row[2] or '09:00',
+            initial_enabled=bool(row[3]), initial_weekend_skip=bool(row[4]),
+        )
+
+    def delete_selected_reminder(self):
+        rid = self._selected_reminder_id()
+        if rid is None:
+            return
+        title = self.reminder_tree.set(str(rid), 'title')
+        if not tk.messagebox.askyesno('确认', f'确定删除提醒「{title}」吗？'):
+            return
+        try:
+            self.tracker.delete_reminder(rid)
+        except sqlite3.Error as exc:
+            self.status.set(f'删除失败：{exc}')
+            return
+        self.refresh_reminders()
+
+    def toggle_selected_reminder(self, enabled):
+        rid = self._selected_reminder_id()
+        if rid is None:
+            return
+        try:
+            self.tracker.toggle_reminder(rid, enabled)
+        except sqlite3.Error as exc:
+            self.status.set(f'操作失败：{exc}')
+            return
+        self.refresh_reminders()
+
+    def show_reminder_dialog(self, record_id=None, initial_title='', initial_rule=None,
+                             initial_fire_time='09:00', initial_enabled=True,
+                             initial_weekend_skip=False):
+        """新建 / 编辑提醒弹窗。
+
+        record_id=None → 新建；否则编辑。规则用"类型选择 → 动态展开参数"模式。
+        """
+        rule = dict(initial_rule) if initial_rule else {'kind': 'yearly', 'month': 1, 'day': 1}
+        win = tk.Toplevel(self)
+        win.title('编辑提醒事项' if record_id is not None else '新建提醒事项')
+        win.geometry('460x480')
+        win.resizable(False, False)
+        win.transient(self)
+        win.grab_set()
+
+        body = ttk.Frame(win, padding=12)
+        body.pack(fill='both', expand=True)
+
+        # 标题
+        ttk.Label(body, text='标题：').grid(row=0, column=0, sticky='w', pady=3)
+        title_var = tk.StringVar(value=initial_title)
+        ttk.Entry(body, textvariable=title_var, width=38).grid(row=0, column=1, sticky='ew', pady=3)
+
+        # 规则类型
+        ttk.Label(body, text='规则类型：').grid(row=1, column=0, sticky='w', pady=3)
+        kind_var = tk.StringVar(value=rule.get('kind', 'yearly'))
+        kinds = [
+            ('每年（生日、纪念日）', 'yearly'),
+            ('每月（每 N 月 X 号）', 'monthly'),
+            ('每周 / 每 N 周的星期 X', 'weekly'),
+            ('倒数（到某天前每天提醒）', 'countdown'),
+            ('单次', 'once'),
+        ]
+        kind_names = {v: t for t, v in kinds}
+        kind_display = tk.StringVar(value=kind_names.get(kind_var.get(), '每年（生日、纪念日）'))
+
+        def _set_kind_display(*_):
+            for text, v in kinds:
+                if v == kind_var.get():
+                    kind_display.set(text)
+                    break
+
+        kind_var.trace_add('write', _set_kind_display)
+        kind_display.trace_add('write', lambda *_: None)  # 只展示，不反向
+        # ttk.Combobox 不可变文本：用 Button + 下拉也行，这里直接用 Combobox 让用户选
+        kind_combo = ttk.Combobox(
+            body, values=[t for t, _ in kinds], state='readonly', width=36,
+            textvariable=kind_display)
+        # 把 display 的 text 映射回 value 麻烦，改成直接用 kind_var 绑定的下拉
+        kind_combo.destroy()  # 丢弃，改用下面的 radiobutton 更清晰
+
+        radio_frame = ttk.Frame(body)
+        radio_frame.grid(row=1, column=1, sticky='w', pady=3)
+        for i, (text, v) in enumerate(kinds):
+            ttk.Radiobutton(radio_frame, text=text, value=v, variable=kind_var).grid(
+                row=i // 2, column=i % 2, sticky='w', padx=2, pady=1)
+
+        # 动态参数区
+        params_outer = ttk.LabelFrame(body, text='具体参数', padding=8)
+        params_outer.grid(row=2, column=0, columnspan=2, sticky='ew', pady=(8, 4))
+        params_frame = ttk.Frame(params_outer)
+        params_frame.pack(fill='x')
+
+        # --- yearly 参数 ---
+        yearly_frame = ttk.Frame(params_frame)
+        ttk.Label(yearly_frame, text='月：').pack(side='left')
+        yearly_month = tk.IntVar(value=rule.get('month', 1))
+        yearly_day = tk.IntVar(value=rule.get('day', 1))
+        ttk.Spinbox(yearly_frame, from_=1, to=12, width=5, textvariable=yearly_month).pack(side='left')
+        ttk.Label(yearly_frame, text=' 日：').pack(side='left', padx=(2, 0))
+        ttk.Spinbox(yearly_frame, from_=1, to=31, width=5, textvariable=yearly_day).pack(side='left')
+
+        # --- monthly 参数 ---
+        monthly_frame = ttk.Frame(params_frame)
+        monthly_every = tk.IntVar(value=rule.get('every', 1))
+        monthly_day = tk.IntVar(value=rule.get('day', 15))
+        ttk.Label(monthly_frame, text='每 ').pack(side='left')
+        ttk.Spinbox(monthly_frame, from_=1, to=24, width=4, textvariable=monthly_every).pack(side='left')
+        ttk.Label(monthly_frame, text=' 个月的 ').pack(side='left')
+        ttk.Spinbox(monthly_frame, from_=1, to=31, width=4, textvariable=monthly_day).pack(side='left')
+        ttk.Label(monthly_frame, text=' 号').pack(side='left')
+
+        # --- weekly 参数 ---
+        weekly_frame = ttk.Frame(params_frame)
+        weekly_every = tk.IntVar(value=rule.get('every', 1))
+        raw_wd = rule.get('weekdays')
+        if raw_wd is None:
+            raw_wd = [rule.get('weekday', 0)]
+        selected_wd = {int(w) for w in raw_wd if 0 <= int(w) <= 6}
+        weekly_vars = {}
+        ttk.Label(weekly_frame, text='每 ').pack(side='left')
+        ttk.Spinbox(weekly_frame, from_=1, to=12, width=4, textvariable=weekly_every).pack(side='left')
+        ttk.Label(weekly_frame, text=' 周的：').pack(side='left', padx=(2, 0))
+        weekday_box = ttk.Frame(weekly_frame)
+        weekday_box.pack(side='left')
+        weekday_names = ['一', '二', '三', '四', '五', '六', '日']
+        for i, name in enumerate(weekday_names):
+            v = tk.BooleanVar(value=(i in selected_wd))
+            weekly_vars[i] = v
+            ttk.Checkbutton(weekday_box, text=name, variable=v).grid(row=0, column=i, padx=1)
+
+        # --- countdown 参数 ---
+        countdown_frame = ttk.Frame(params_frame)
+        countdown_target = tk.StringVar(value=rule.get('target', date.today().isoformat().replace('-', '.')))
+        ttk.Label(countdown_frame, text='目标日期（YYYY.MM.DD）：').pack(side='left')
+        ttk.Entry(countdown_frame, textvariable=countdown_target, width=14).pack(side='left')
+
+        # --- once 参数 ---
+        once_frame = ttk.Frame(params_frame)
+        once_date = tk.StringVar(value=rule.get('date', date.today().isoformat().replace('-', '.')))
+        ttk.Label(once_frame, text='日期（YYYY.MM.DD）：').pack(side='left')
+        ttk.Entry(once_frame, textvariable=once_date, width=14).pack(side='left')
+
+        param_frames = {
+            'yearly': yearly_frame, 'monthly': monthly_frame, 'weekly': weekly_frame,
+            'countdown': countdown_frame, 'once': once_frame,
+        }
+
+        def _show_params():
+            for f in param_frames.values():
+                f.pack_forget()
+            param_frames.get(kind_var.get(), yearly_frame).pack(fill='x')
+
+        kind_var.trace_add('write', lambda *_: _show_params())
+        _show_params()
+
+        # 每天提醒时间
+        time_row = ttk.Frame(body)
+        time_row.grid(row=3, column=0, columnspan=2, sticky='w', pady=3)
+        ttk.Label(time_row, text='每天提醒时间：').pack(side='left')
+        fire_time = tk.StringVar(value=initial_fire_time)
+        ttk.Entry(time_row, textvariable=fire_time, width=7).pack(side='left')
+        ttk.Label(time_row, text=' （HH:MM，默认 09:00）').pack(side='left', padx=4)
+
+        # 工作日除外
+        skip_row = ttk.Frame(body)
+        skip_row.grid(row=4, column=0, columnspan=2, sticky='w', pady=3)
+        weekend_skip = tk.BooleanVar(value=initial_weekend_skip)
+        ttk.Checkbutton(skip_row, text='工作日除外（周末顺延到周一）', variable=weekend_skip).pack(side='left')
+
+        # 启用状态
+        enable_row = ttk.Frame(body)
+        enable_row.grid(row=5, column=0, columnspan=2, sticky='w', pady=3)
+        enabled_var = tk.BooleanVar(value=initial_enabled)
+        ttk.Checkbutton(enable_row, text='立即启用', variable=enabled_var).pack(side='left')
+
+        # 按钮
+        btns = ttk.Frame(body)
+        btns.grid(row=6, column=0, columnspan=2, sticky='e', pady=(14, 0))
+
+        def _collect_rule():
+            """把动态控件里的值收集成 rule dict，同时做基本校验。"""
+            k = kind_var.get()
+            r = {'kind': k}
+            if k == 'yearly':
+                m, d = yearly_month.get(), yearly_day.get()
+                if not (1 <= m <= 12 and 1 <= d <= 31):
+                    raise ValueError(f'月/日 不合法：{m}/{d}')
+                r.update(month=m, day=d)
+            elif k == 'monthly':
+                e, d = monthly_every.get(), monthly_day.get()
+                if e < 1:
+                    raise ValueError('间隔月数必须 ≥ 1')
+                if not (1 <= d <= 31):
+                    raise ValueError('日必须在 1~31 之间')
+                r.update(every=e, day=d)
+            elif k == 'weekly':
+                wd = sorted([w for w, v in weekly_vars.items() if v.get()])
+                if not wd:
+                    raise ValueError('请至少勾选一个星期。')
+                r.update(every=weekly_every.get(), weekdays=wd)
+            elif k == 'countdown':
+                d = WorkTracker.parse_date_input(countdown_target.get())
+                if d is None:
+                    raise ValueError('请填写有效的目标日期，格式 YYYY.MM.DD')
+                r.update(target=d.isoformat())
+            elif k == 'once':
+                d = WorkTracker.parse_date_input(once_date.get())
+                if d is None:
+                    raise ValueError('请填写有效的日期，格式 YYYY.MM.DD')
+                r.update(date=d.isoformat())
+            return r
+
+        def _on_save():
+            t = title_var.get().strip()
+            if not t:
+                tk.messagebox.showerror('校验失败', '请填写标题。', parent=win)
+                return
+            try:
+                r = _collect_rule()
+            except (tk.TclError, ValueError) as exc:
+                tk.messagebox.showerror('校验失败', str(exc), parent=win)
+                return
+            ft = fire_time.get().strip() or '09:00'
+            try:
+                # 时间格式校验 HH:MM
+                datetime.strptime(ft, '%H:%M')
+            except ValueError:
+                tk.messagebox.showerror('校验失败', '时间格式应为 HH:MM，例如 09:00', parent=win)
+                return
+            try:
+                if record_id is None:
+                    self.tracker.add_reminder(t, r, ft, weekend_skip.get())
+                else:
+                    self.tracker.update_reminder(
+                        record_id, title=t, rule=r, fire_time=ft,
+                        weekend_skip=weekend_skip.get(), enabled=enabled_var.get())
+            except (sqlite3.Error, ValueError) as exc:
+                tk.messagebox.showerror('保存失败', str(exc), parent=win)
+                return
+            self.refresh_reminders()
+            win.destroy()
+
+        ttk.Button(btns, text='保存', command=_on_save).pack(side='right', padx=(6, 0))
+        ttk.Button(btns, text='取消', command=win.destroy).pack(side='right')
+        win.bind('<Escape>', lambda e: win.destroy())
+        win.bind('<Return>', lambda e: _on_save())
+        self.center_dialog(win)
+
 
     def _build_work_calendar(self, parent):
         panel = ttk.LabelFrame(parent, text='每日工时月历', padding=5)
@@ -2613,104 +3233,124 @@ class WorkTrackerApp(tk.Tk):
                     self._reminder_stamp = stamp
                     self._reminders_dirty = False
                     reminders = self.tracker.due_reminders()
-                    signature = tuple(reminders)
-                    # 提醒窗可能被用户直接关掉，残留引用会让后续提醒永久静默。
+                    cycle_due = self.tracker.consume_due_reminders()
+                    # 合并两类提醒，统一弹出一个卡片
+                    combined = [('todo',) + r for r in reminders]
+                    combined += [('cycle',) + r for r in cycle_due]
+                    # 每类各自判重：同一天同一条只能弹一次（用 last_fired 标记）
+                    signature = tuple(sorted(combined))
                     if self._reminder_window is not None and not self._reminder_window.winfo_exists():
                         self._reminder_window = None
                     if self._reminder_window is not None and signature != self._reminder_signature:
                         self._reminder_window.destroy()
                         self._reminder_window = None
-                    if reminders and self._reminder_window is None:
-                        self._show_reminder(reminders)
+                    if combined and self._reminder_window is None:
+                        self._show_reminder(combined)
+                    if cycle_due:
+                        self.refresh_reminders()
         except (sqlite3.Error, tk.TclError) as exc:
             self.status.set(f'提醒检查失败：{exc}')
         finally:
             if not self._closing:
                 self._background_id = self.after(1000, self._background_tick)
 
-    def _show_reminder(self, reminders):
-        record_id, task, due = reminders[0]
+    def _show_reminder(self, combined):
+        """统一的右下角提醒卡片。combined 格式：
+          [('todo', record_id, task, due), ('cycle', record_id, title, fire_time), ...]
+        两种类型一起弹，分别展示各自的内容片段。
+        """
+        # 兼容旧调用（纯 todo 三元组）
+        if combined and isinstance(combined[0], tuple) and len(combined[0]) == 3:
+            combined = [('todo',) + r for r in combined]
         window = tk.Toplevel(self)
-        # 不设 transient，主窗口隐藏或最小化时提醒仍独立显示。
         self._reminder_window = window
-        self._reminder_signature = tuple(reminders)
-        window.title('RH · 待办到期提醒')
-        window.geometry('400x270')
+        self._reminder_signature = tuple(combined)
+        has_todo = any(r[0] == 'todo' for r in combined)
+        has_cycle = any(r[0] == 'cycle' for r in combined)
+        parts = []
+        if has_todo:
+            parts.append('待办到期')
+        if has_cycle:
+            parts.append('循环提醒')
+        window.title('RH · ' + ' / '.join(parts))
+        window.geometry('420x320')
         window.resizable(False, False)
         window.attributes('-topmost', True)
         frame = ttk.Frame(window, padding=8)
         frame.pack(fill='both', expand=True)
-        deadline = self.parse_deadline(due)
-        days = (deadline.date() - date.today()).days
-        if self.has_deadline_time(due):
-            delta = deadline - datetime.now()
-            count = max(1, math.ceil(abs(delta.total_seconds()) / 60))
-            timing = f'已逾期 {count} 分钟' if delta.total_seconds() < 0 else f'距截止 {count} 分钟'
-        else:
-            timing = '明天到期' if days == 1 else '今天到期' if days == 0 else f'已逾期 {-days} 天'
-        ttk.Label(frame, text=f'{timing}  ·  共 {len(reminders)} 项待确认', style='Summary.TLabel').pack(anchor='w')
-        task_frame = ttk.Frame(frame)
-        task_frame.pack(fill='both', expand=True, pady=4)
-        text = tk.Text(task_frame, height=2, wrap='word', font=('Microsoft YaHei UI', 10))
-        text_scroll = ttk.Scrollbar(task_frame, orient='vertical', command=text.yview)
+
+        today = date.today()
+
+        # 汇总条
+        todo_n = sum(1 for r in combined if r[0] == 'todo')
+        cycle_n = sum(1 for r in combined if r[0] == 'cycle')
+        sub = []
+        if todo_n:
+            sub.append(f'{todo_n} 项待办')
+        if cycle_n:
+            sub.append(f'{cycle_n} 项循环提醒')
+        ttk.Label(frame, text='  ·  '.join(sub), style='Summary.TLabel').pack(anchor='w')
+
+        # 内容区：把所有条目列出来
+        text_frame = ttk.Frame(frame)
+        text_frame.pack(fill='both', expand=True, pady=4)
+        text = tk.Text(text_frame, height=8, wrap='word',
+                       font=('Microsoft YaHei UI', 10),
+                       bg='#f8fafc', relief='flat', borderwidth=0)
+        text_scroll = ttk.Scrollbar(text_frame, orient='vertical', command=text.yview)
         text.configure(yscrollcommand=text_scroll.set)
         text_scroll.pack(side='right', fill='y')
-        text.insert('1.0', task)
+        text.tag_configure('todo_tag', foreground='#b45309',
+                           font=('Microsoft YaHei UI', 10, 'bold'))
+        text.tag_configure('cycle_tag', foreground='#1d4ed8',
+                           font=('Microsoft YaHei UI', 10, 'bold'))
+        text.tag_configure('meta_tag', foreground='#64748b',
+                           font=('Microsoft YaHei UI', 9))
+        first = True
+        for r in combined:
+            if not first:
+                text.insert('end', '\n')
+            first = False
+            rtype = r[0]
+            if rtype == 'todo':
+                _, record_id, task, due = r
+                deadline = self.parse_deadline(due)
+                days = (deadline.date() - today).days
+                if self.has_deadline_time(due):
+                    delta = deadline - datetime.now()
+                    count = max(1, math.ceil(abs(delta.total_seconds()) / 60))
+                    timing = f'已逾期 {count} 分钟' if delta.total_seconds() < 0 else f'距截止 {count} 分钟'
+                else:
+                    timing = '明天到期' if days == 1 else '今天到期' if days == 0 else f'已逾期 {-days} 天'
+                text.insert('end', '【待办到期】', 'todo_tag')
+                text.insert('end', task.strip() + '\n')
+                text.insert('end', f'   {timing}  ·  截止 {self.display_deadline(due)}', 'meta_tag')
+            elif rtype == 'cycle':
+                _, record_id, title, fire_time = r
+                text.insert('end', '【循环提醒】', 'cycle_tag')
+                text.insert('end', title.strip() + '\n')
+                text.insert('end', f'   今天 {fire_time or "09:00"} 触发', 'meta_tag')
         text.configure(state='disabled')
         text.pack(side='left', fill='both', expand=True)
-        ttk.Label(frame, text=f'截止：{self.display_deadline(due)}').pack(anchor='w')
-        controls = ttk.Frame(frame)
-        controls.pack(fill='x', pady=4)
-        ttk.Label(controls, text='稍后提醒（分钟）：').pack(side='left')
-        minutes = tk.StringVar(window, value='30')
-        ttk.Combobox(controls, textvariable=minutes, values=('10', '30', '60', '120'), width=10).pack(side='left')
+
         feedback = tk.StringVar(window)
-        ttk.Label(frame, textvariable=feedback, wraplength=380).pack(fill='x')
+        ttk.Label(frame, textvariable=feedback, wraplength=400).pack(fill='x')
 
-        def update_preview(*args):
-            try:
-                value = float(minutes.get())
-                if not math.isfinite(value) or value <= 0:
-                    raise ValueError
-                until = datetime.now() + timedelta(minutes=value)
-                feedback.set(f'将在 {until:%Y.%m.%d %H:%M} 再次提醒')
-            except (ValueError, OverflowError):
-                feedback.set('请输入大于 0 的有效分钟数。')
-
-        minutes.trace_add('write', update_preview)
-        update_preview()
-
-        def act(action):
-            try:
-                value = float(minutes.get()) if action == 'snooze' else None
-                until = self.tracker.reminder_action(record_id, action, value)
-            except (ValueError, OverflowError, sqlite3.Error) as exc:
-                feedback.set(str(exc))
-                return
+        def _dismiss_all():
+            """关闭本次提醒（循环提醒本来就是消费式的，已在 consume_due_reminders 里推进了 next_fire）。"""
+            # todos 不自动 dismiss，留给用户自己处理（避免误关闭）；cycle 已经推进了 next_fire，
+            # 这里只是把窗口关掉。
             window.destroy()
             self._reminder_window = None
             self._reminder_signature = None
-            self.refresh_todos()
-            self.status.set(f'将在 {until:%Y.%m.%d %H:%M} 再次提醒' if until else '提醒处理已保存')
 
         buttons = ttk.Frame(frame)
-        buttons.pack(fill='x', pady=(4, 0))
-        buttons.columnconfigure((0, 1), weight=1)
-        ttk.Button(buttons, text='稍后提醒', command=lambda: act('snooze')).grid(row=0, column=0, sticky='ew', padx=2, pady=2)
-        ttk.Button(buttons, text='关闭本次提醒', command=lambda: act('dismiss')).grid(row=0, column=1, sticky='ew', padx=2, pady=2)
-        ttk.Button(buttons, text='此任务不再提醒', command=lambda: act('disable')).grid(row=1, column=0, sticky='ew', padx=2, pady=2)
-        ttk.Button(buttons, text='标记完成', command=lambda: act('complete')).grid(row=1, column=1, sticky='ew', padx=2, pady=2)
-        def close_and_snooze():
-            try:
-                value = float(minutes.get())
-                if not math.isfinite(value) or value <= 0:
-                    raise ValueError
-                datetime.now() + timedelta(minutes=value)
-            except (ValueError, OverflowError):
-                minutes.set('30')
-            act('snooze')
+        buttons.pack(fill='x', pady=(6, 0))
+        buttons.columnconfigure((0,), weight=1)
+        ttk.Button(buttons, text='关闭本次提醒', command=_dismiss_all).grid(
+            row=0, column=0, sticky='ew', padx=2, pady=2)
 
-        window.protocol('WM_DELETE_WINDOW', close_and_snooze)
+        window.protocol('WM_DELETE_WINDOW', _dismiss_all)
         self.center_dialog(window, corner=True)
 
     def on_close(self):
