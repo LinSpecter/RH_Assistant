@@ -256,16 +256,23 @@ def _create_archive(connection, db_path, year, conditions, note, remove=False, t
                     if records:
                         marks = ','.join('?' for _ in records[0])
                         created_index = next(index for index, col in enumerate(source_columns) if col[1] == 'created_at')
+                        # 先批量检查 ID 冲突：同一 ID 但创建时间不同，说明来自别的库，拒绝覆盖。
                         for row in records:
-                            old = output.execute(f'SELECT * FROM {table} WHERE id=?', (row[0],)).fetchone()
+                            old = expected.get(row[0])
                             if old is not None and old[created_index] != row[created_index]:
                                 raise ValueError('记录 ID 相同但创建时间不同，可能来自其他数据库，已拒绝覆盖。')
-                            output.execute(f'INSERT OR REPLACE INTO {table} VALUES ({marks})', row)
-                            if output.execute(f'SELECT * FROM {table} WHERE id=?', (row[0],)).fetchone() != row:
-                                raise ValueError('归档内容校验失败，主库未移除数据。')
-                            output.execute('INSERT INTO archive_update_rows VALUES (?,?)', (table, row[0]))
-                            expected[row[0]] = row
-                    if output.execute(f'SELECT * FROM {table} ORDER BY id').fetchall() != [expected[key] for key in sorted(expected)]:
+                        # 批量写入：逐行三次 SQL 会退化成上万次往返，executemany 一次搞定。
+                        output.executemany(f'INSERT OR REPLACE INTO {table} VALUES ({marks})', records)
+                        output.executemany('INSERT INTO archive_update_rows VALUES (?,?)',
+                                           [(table, row[0]) for row in records])
+                        expected.update({row[0]: row for row in records})
+                    # 一次性回读整表做校验，替代原来逐行查询回读。
+                    merged_rows = output.execute(f'SELECT * FROM {table} ORDER BY id').fetchall()
+                    merged_by_id = {row[0]: row for row in merged_rows}
+                    for row in records:
+                        if merged_by_id.get(row[0]) != row:
+                            raise ValueError('归档内容校验失败，主库未移除数据。')
+                    if merged_rows != [expected[key] for key in sorted(expected)]:
                         raise ValueError('合并后历史记录校验失败，旧归档保持不变。')
                     counts[table] = len(records)
                 output.execute('CREATE TABLE IF NOT EXISTS archive_info (year INTEGER, created_at TEXT, note TEXT)')
@@ -352,6 +359,7 @@ def export_work_excel(connection, path, start=None, end=None, source='当前记�
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Font, PatternFill
     from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
+    from openpyxl.cell import WriteOnlyCell
 
     def check_text(value):
         if isinstance(value, str):
@@ -370,53 +378,92 @@ def export_work_excel(connection, path, start=None, end=None, source='当前记�
     where, params = (' WHERE date BETWEEN ? AND ?', (start, end)) if start else ('', ())
     rows = connection.execute('SELECT id,date,project,description,hours,created_at FROM work_logs' + where +
                               ' ORDER BY date,created_at,id', params).fetchall()
-    book = Workbook()
-    detail = book.active
-    detail.title = '工时记录'
-    detail.append(['序号', '日期', '项目', '工作内容', '工时（小时）', '创建时间', '原记录ID'])
+    # write_only 模式逐行写入内存缓冲后一次性落盘：普通模式会在内存里堆满单元格对象，
+    # 几万行时既慢又吃内存。样式对象全部复用，不逐格新建。
+    book = Workbook(write_only=True)
+    detail = book.create_sheet('工时记录')
+    detail.freeze_panes = 'A2'
+    # write_only 模式下列宽必须在首次 append 之前设定，否则不会写入文件。
+    for column, width in {'A': 8, 'B': 15, 'C': 28, 'D': 75, 'E': 18, 'F': 23, 'G': 14}.items():
+        detail.column_dimensions[column].width = width
+    body_alignment = Alignment(vertical='top', wrap_text=True)
+    header_font = Font(bold=True, color='FFFFFF')
+    header_fill = PatternFill('solid', fgColor='2563EB')
+    date_format = 'yyyy.mm.dd'
+
+    def make_cell(sheet, value, number_format=None, force_text=False):
+        """建一个带统一对齐样式的单元格。
+
+        文字列一律强制 text：用户正文即使以 = 开头，也必须是文字而不是 Excel 公式。
+        """
+        cell = WriteOnlyCell(sheet, value=value)
+        cell.alignment = body_alignment
+        if force_text and isinstance(value, str):
+            cell.data_type = 's'
+        if number_format:
+            cell.number_format = number_format
+        return cell
+
     daily, projects = {}, {}
     try:
+        header = []
+        for title in ('序号', '日期', '项目', '工作内容', '工时（小时）', '创建时间', '原记录ID'):
+            cell = make_cell(detail, title, force_text=True)
+            cell.font = header_font
+            cell.fill = header_fill
+            header.append(cell)
+        detail.append(header)
         for sequence, (record_id, day, project, description, hours, created) in enumerate(rows, 1):
             for value in (project, description, created):
                 check_text(value)
-            detail.append([sequence, date.fromisoformat(day), project or '', description or '', hours,
-                           local_timestamp(created), record_id])
-            detail.cell(detail.max_row, 2).number_format = 'yyyy.mm.dd'
+            cells = [
+                make_cell(detail, sequence),
+                make_cell(detail, date.fromisoformat(day), number_format=date_format),
+                make_cell(detail, project or '', force_text=True),
+                make_cell(detail, description or '', force_text=True),
+                make_cell(detail, hours),
+                make_cell(detail, local_timestamp(created), force_text=True),
+                make_cell(detail, record_id),
+            ]
+            detail.append(cells)
             daily[day] = daily.get(day, 0) + hours
             name = project or '未命名项目'
             projects[name] = projects.get(name, 0) + hours
+        # 筛选范围始终覆盖表头：空数据时也要保留表头那一行，与旧版行为一致。
+        detail.auto_filter.ref = f'A1:G{len(rows) + 1}'
         summary = book.create_sheet('汇总')
-        summary.append(['数据来源', source])
-        summary.append(['查询范围', f'{start} 至 {end}' if start else '全部记录'])
-        summary.append(['记录数', len(rows)])
-        summary.append(['总工时（小时）', sum(row[4] for row in rows)])
-        summary.append([])
-        summary.append(['日期', '工时（小时）'])
-        for day, hours in sorted(daily.items()):
-            summary.append([date.fromisoformat(day), hours])
-            summary.cell(summary.max_row, 1).number_format = 'yyyy.mm.dd'
-        summary.append([])
-        summary.append(['项目', '工时（小时）'])
-        for name, hours in sorted(projects.items(), key=lambda item: (-item[1], item[0])):
-            summary.append([name, hours])
-        for sheet in book:
-            sheet.freeze_panes = 'A2'
-            for row in sheet:
-                for cell in row:
-                    if isinstance(cell.value, str):
-                        if len(cell.value) > 32767:
-                            raise ValueError('文本超过 Excel 单元格 32767 字限制，未导出，原记录未改变。')
-                        # 用户正文即使以 = 开头，也必须是文字而不是 Excel 公式。
-                        cell.data_type = 's'
-                    cell.alignment = Alignment(vertical='top', wrap_text=True)
-            for cell in sheet[1]:
-                cell.font = Font(bold=True, color='FFFFFF')
-                cell.fill = PatternFill('solid', fgColor='2563EB')
-        for column, width in {'A': 8, 'B': 15, 'C': 28, 'D': 75, 'E': 18, 'F': 23, 'G': 14}.items():
-            detail.column_dimensions[column].width = width
-        detail.auto_filter.ref = detail.dimensions
+        summary.freeze_panes = 'A2'
         summary.column_dimensions['A'].width = 38
         summary.column_dimensions['B'].width = 65
+
+        def summary_row(values, header=False):
+            """汇总表的一行；文字列同样要防公式注入、检查长度。"""
+            cells = []
+            for value in values:
+                if isinstance(value, str):
+                    check_text(value)
+                cell = make_cell(summary, value, force_text=True)
+                if header:
+                    cell.font = header_font
+                    cell.fill = header_fill
+                cells.append(cell)
+            summary.append(cells)
+
+        summary_row(['数据来源', source], header=True)
+        summary_row(['查询范围', f'{start} 至 {end}' if start else '全部记录'])
+        summary_row(['记录数', len(rows)])
+        summary_row(['总工时（小时）', sum(row[4] for row in rows)])
+        summary.append([make_cell(summary, None), make_cell(summary, None)])
+        summary_row(['日期', '工时（小时）'])
+        for day, hours in sorted(daily.items()):
+            summary.append([
+                make_cell(summary, date.fromisoformat(day), number_format=date_format),
+                make_cell(summary, hours),
+            ])
+        summary.append([make_cell(summary, None), make_cell(summary, None)])
+        summary_row(['项目', '工时（小时）'])
+        for name, hours in sorted(projects.items(), key=lambda item: (-item[1], item[0])):
+            summary_row([name, hours])
         _write_export(path, lambda temporary: book.save(temporary))
     finally:
         book.close()
@@ -495,6 +542,8 @@ class WorkTracker:
             if name not in columns:
                 self.conn.execute(f'ALTER TABLE todos ADD COLUMN {name} {definition}')
         self.conn.execute('CREATE INDEX IF NOT EXISTS idx_work_date ON work_logs(date, created_at, id)')
+        # 项目下拉框每次刷新都要 DISTINCT 列出所有项目，有索引就不必全表扫描。
+        self.conn.execute('CREATE INDEX IF NOT EXISTS idx_work_project ON work_logs(project)')
         self.conn.execute('CREATE INDEX IF NOT EXISTS idx_todos_status ON todos(status, created_at, id)')
         # 循环提醒表：与 work_logs / todos 完全独立，新增时绝不触碰老数据。
         self.cursor.execute('''
@@ -1131,24 +1180,24 @@ class WorkTrackerApp(tk.Tk):
         try:
             today = date.today()
             week_start = today - timedelta(days=today.weekday())
+            week_end = week_start + timedelta(days=6)
             month_start = today.replace(day=1)
-            rows = self.view_connection.execute(
-                'SELECT date, SUM(hours) FROM work_logs GROUP BY date'
-            ).fetchall()
-            today_hours = 0.0
-            week_hours = 0.0
-            month_hours = 0.0
-            for day, hours in rows:
-                try:
-                    parsed = date.fromisoformat(day)
-                except (TypeError, ValueError):
-                    continue
-                if parsed == today:
-                    today_hours += hours or 0
-                if parsed >= week_start:
-                    week_hours += hours or 0
-                if parsed >= month_start:
-                    month_hours += hours or 0
+            month_end = today.replace(day=calendar.monthrange(today.year, today.month)[1])
+            # 只统计本周和本月这两段区间，让 idx_work_date 索引直接定位范围，
+            # 不再把整张表按日期分组后拉回 Python 逐行判断。
+            # 区间上下界都取自真实周期：过去全量不参与，未来预录入的工时也不计入，
+            # 扫描量因此是恒定的，库里有多少数据都不会拖慢刷新。
+            scan_start = min(week_start, month_start)
+            scan_end = max(week_end, month_end)
+            today_hours, week_hours, month_hours = self.view_connection.execute(
+                'SELECT COALESCE(SUM(CASE WHEN date=? THEN hours END), 0), '
+                'COALESCE(SUM(CASE WHEN date>=? AND date<=? THEN hours END), 0), '
+                'COALESCE(SUM(CASE WHEN date>=? AND date<=? THEN hours END), 0) '
+                'FROM work_logs WHERE date>=? AND date<=?',
+                (today.isoformat(), week_start.isoformat(), week_end.isoformat(),
+                 month_start.isoformat(), month_end.isoformat(),
+                 scan_start.isoformat(), scan_end.isoformat())
+            ).fetchone()
             pending = self.view_connection.execute(
                 "SELECT COUNT(*) FROM todos WHERE status='pending'"
             ).fetchone()[0]
