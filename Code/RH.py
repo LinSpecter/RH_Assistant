@@ -1148,7 +1148,7 @@ class WorkTrackerApp(tk.Tk):
         self.reminder_tab = ttk.Frame(tabs, padding=8)
         tabs.add(self.work_tab, text='  工时记录  ')
         tabs.add(self.todo_tab, text='  待办事项  ')
-        tabs.add(self.reminder_tab, text='  🔔 提醒事项  ')
+        tabs.add(self.reminder_tab, text='  提醒事项  ')
         self._build_work_tab()
         self._build_todo_tab()
         self._build_reminder_tab()
@@ -3386,9 +3386,22 @@ class WorkTrackerApp(tk.Tk):
         ttk.Label(frame, textvariable=feedback, wraplength=400).pack(fill='x')
 
         def _dismiss_all():
-            """关闭本次提醒（循环提醒本来就是消费式的，已在 consume_due_reminders 里推进了 next_fire）。"""
-            # todos 不自动 dismiss，留给用户自己处理（避免误关闭）；cycle 已经推进了 next_fire，
-            # 这里只是把窗口关掉。
+            """关闭本次提醒。
+
+            必须把"今天已确认"写回数据库，否则 due_reminders() 里的
+            last_day 一直是空的，下一分钟又判定为该提醒 → 无限重复弹窗。
+            循环提醒本身是消费式的（consume_due_reminders 已推进 next_fire），
+            这里只需要处理待办。
+            """
+            for entry in combined:
+                if entry[0] != 'todo':
+                    continue
+                try:
+                    self.tracker.reminder_action(entry[1], 'dismiss')
+                except (sqlite3.Error, ValueError):
+                    continue
+            # 让后台 tick 立刻按新状态重算，不再重复弹出。
+            self._reminders_dirty = True
             window.destroy()
             self._reminder_window = None
             self._reminder_signature = None
