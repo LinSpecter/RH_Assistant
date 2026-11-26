@@ -1,3 +1,30 @@
+"""
+RH 每日工作记录
+===============
+
+功能：
+    记录和统计每日工时，管理待办及循环提醒，支持 Excel / Markdown 导出、
+    数据备份与独立归档，并可通过系统托盘持续提醒。
+
+版本记录：
+    v1.2  2026.11.26
+        - 仅写日期的待办统一 09:00 后提醒，提前/当天/逾期均适用
+        - 循环提醒按设定时间到点才弹，错过日期后打开立即补弹
+    v1.1  2026.11.26
+        - 待办提醒支持提前、当天、逾期三个阶段独立勾选
+        - 提前天数支持 1–365 天，自定义后从第 N 天起每天提醒
+        - 带时分任务提前按日期、当天到点、逾期按截止时刻判断
+        - 老数据库自动升级并保留原有提醒习惯
+        - 修正多天以后提醒弹窗的倒计时文案
+    v1.0  2026.11.26
+        - 建立统一版本号、文件头版本记录和界面版本信息
+        - 带具体时分的待办到设定时间才提醒，不再提前 24 小时
+        - 支持工时记录、查询汇总和 Excel 导出
+        - 支持待办事项、循环提醒和 Markdown 导出
+        - 支持数据备份、独立归档和只读查看
+        - 支持系统托盘与启动画面
+"""
+
 import sqlite3
 import os
 import sys
@@ -10,7 +37,14 @@ import queue
 import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, font as tkfont
-from datetime import datetime, date, timedelta, timezone
+from datetime import datetime, date, time, timedelta, timezone
+
+
+APP_VERSION = "1.2"
+APP_RELEASE_DATE = "2026.11.26"
+
+# 仅写日期的待办统一在当天 09:00 后提醒。
+DATE_ONLY_REMIND_TIME = time(9, 0)
 
 
 def enable_dpi_awareness():
@@ -538,9 +572,19 @@ class WorkTracker:
             ('reminder_enabled', 'INTEGER NOT NULL DEFAULT 1'),
             ('reminder_snooze_until', 'TEXT'),
             ('reminder_last_day', 'TEXT'),
+            ('reminder_before', 'INTEGER NOT NULL DEFAULT 1'),
+            ('reminder_on_day', 'INTEGER NOT NULL DEFAULT 1'),
+            ('reminder_overdue', 'INTEGER NOT NULL DEFAULT 1'),
+            ('reminder_before_days', 'INTEGER NOT NULL DEFAULT 1'),
         ):
             if name not in columns:
                 self.conn.execute(f'ALTER TABLE todos ADD COLUMN {name} {definition}')
+                if name == 'reminder_before':
+                    # 仅首次升级时保留旧版行为：带时分任务默认不提前提醒。
+                    self.conn.execute(
+                        "UPDATE todos SET reminder_before=0 WHERE due_date IS NOT NULL "
+                        "AND (instr(due_date, 'T') > 0 OR instr(trim(due_date), ' ') > 0)"
+                    )
         self.conn.execute('CREATE INDEX IF NOT EXISTS idx_work_date ON work_logs(date, created_at, id)')
         # 项目下拉框每次刷新都要 DISTINCT 列出所有项目，有索引就不必全表扫描。
         self.conn.execute('CREATE INDEX IF NOT EXISTS idx_work_project ON work_logs(project)')
@@ -564,24 +608,24 @@ class WorkTracker:
         self.conn.commit()
 
     def due_reminders(self, now=None):
-        """每天一次；到时的稍后提醒优先，不受当天已提醒限制。"""
+        """按提前、当天、逾期设置筛选；稍后提醒到时优先。"""
         now = now or datetime.now()
         result = []
         rows = self.conn.execute(
-            "SELECT id, task, due_date, reminder_snooze_until, reminder_last_day "
+            "SELECT id, task, due_date, reminder_snooze_until, reminder_last_day, "
+            "reminder_before, reminder_on_day, reminder_overdue, reminder_before_days "
             "FROM todos WHERE status='pending' AND reminder_enabled=1 AND due_date IS NOT NULL"
         ).fetchall()
-        for record_id, task, due, snooze, last_day in rows:
+        for record_id, task, due, snooze, last_day, before, on_day, overdue, before_days in rows:
             try:
                 deadline = WorkTrackerApp.parse_deadline(due)
                 day = deadline.date()
                 if snooze:
                     eligible = datetime.fromisoformat(snooze) <= now
-                elif WorkTrackerApp.has_deadline_time(due):
-                    # 带时分的任务不提前一天，到设定时间才进入提醒范围。
-                    eligible = deadline <= now and last_day != now.date().isoformat()
                 else:
-                    eligible = (day - now.date()).days <= 1 and last_day != now.date().isoformat()
+                    eligible = last_day != now.date().isoformat() and WorkTrackerApp.todo_reminder_due(
+                        due, before, on_day, overdue, before_days, now
+                    )
             except (ValueError, TypeError):
                 continue
             if eligible:
@@ -843,6 +887,14 @@ class WorkTracker:
         due = []
         with self.conn:
             for rid, title, rule, nxt, fire_time, skip, fired, last_fired in rows:
+                # 当天到点才弹；错过日期（next_fire 早于今天）则打开后立即补弹。
+                if nxt == today_str:
+                    try:
+                        fire = datetime.strptime(str(fire_time or '09:00').strip(), '%H:%M').time()
+                    except ValueError:
+                        fire = DATE_ONLY_REMIND_TIME
+                    if now.time() < fire:
+                        continue
                 # countdown 过了 target / once 已过 → 自动停用
                 import json as _json
                 parsed = _json.loads(rule) if isinstance(rule, str) else rule
@@ -902,7 +954,33 @@ class WorkTracker:
 
     # ==================== 待办事项管理 ====================
 
-    def add_todo(self, task, priority="medium", due_date=None):
+    @staticmethod
+    def normalize_reminder_options(due_date, options=None):
+        """生成并校验提醒设置；未提供时沿用仅日期/带时分任务的旧默认。"""
+        values = {
+            'enabled': 1,
+            'before': 0 if WorkTrackerApp.has_deadline_time(due_date) else 1,
+            'on_day': 1,
+            'overdue': 1,
+            'before_days': 1,
+        }
+        if options:
+            for key in values:
+                if key in options:
+                    values[key] = options[key]
+        for key in ('enabled', 'before', 'on_day', 'overdue'):
+            values[key] = int(bool(values[key]))
+        try:
+            values['before_days'] = int(str(values['before_days']).strip())
+        except (ValueError, TypeError):
+            raise ValueError('提前天数必须是 1–365 的整数。') from None
+        if not 1 <= values['before_days'] <= 365:
+            raise ValueError('提前天数必须是 1–365 的整数。')
+        if values['enabled'] and not any(values[key] for key in ('before', 'on_day', 'overdue')):
+            raise ValueError('启用到期提醒时，请至少勾选提前、当天或逾期中的一项。')
+        return values
+
+    def add_todo(self, task, priority="medium", due_date=None, reminder_options=None):
         """添加待办事项。"""
         if priority not in ('high', 'medium', 'low'):
             priority = 'medium'
@@ -917,9 +995,12 @@ class WorkTracker:
                     raise ValueError(f'截止日期格式无效：{due_date}')
         if not str(task or '').strip():
             raise ValueError('任务描述不能为空。')
+        options = self.normalize_reminder_options(due_date, reminder_options)
         self.cursor.execute(
-            'INSERT INTO todos (task, priority, due_date) VALUES (?, ?, ?)',
-            (str(task).strip(), priority, due_date)
+            'INSERT INTO todos (task, priority, due_date, reminder_enabled, reminder_before, '
+            'reminder_on_day, reminder_overdue, reminder_before_days) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            (str(task).strip(), priority, due_date, options['enabled'], options['before'],
+             options['on_day'], options['overdue'], options['before_days'])
         )
         self.conn.commit()
         return self.cursor.lastrowid
@@ -1028,7 +1109,7 @@ class WorkTrackerApp(tk.Tk):
 
     def __init__(self, db_path=None):
         super().__init__()
-        self.title('RH · 每日工作记录')
+        self.title(f'RH · 每日工作记录 v{APP_VERSION}')
         # 使用内置绘制的记事本图标，无需外部图片；保留引用避免被回收。
         self._app_icon = tk.PhotoImage(master=self, width=32, height=32)
         self._app_icon.put('#2563eb', to=(4, 2, 29, 30))
@@ -1136,6 +1217,8 @@ class WorkTrackerApp(tk.Tk):
         footer = ttk.Frame(self, padding=(12, 5))
         footer.pack(side='bottom', fill='x')
         ttk.Label(footer, textvariable=self.status).pack(side='left')
+        ttk.Label(footer, text=f'Version {APP_VERSION}, {APP_RELEASE_DATE}',
+                  font=('Arial', 8), foreground='#666666').pack(side='right', padx=(12, 0))
         self._undo_button = ttk.Button(footer, text='撤销删除', command=self._undo_delete)
         ttk.Button(footer, text='数据库位置', command=lambda: self.show_message(
             '数据库位置', self.db_path, parent=self
@@ -1439,7 +1522,29 @@ class WorkTrackerApp(tk.Tk):
             variable.set(canonical)
 
     @staticmethod
-    def reminder_status(status, due, enabled, snooze, last_day, now=None):
+    def todo_reminder_due(due, before, on_day, overdue, before_days, now=None):
+        """按日期和时分判断提前、当天、逾期三个阶段，任一启用阶段满足即提醒。"""
+        now = now or datetime.now()
+        deadline = WorkTrackerApp.parse_deadline(due)
+        has_time = WorkTrackerApp.has_deadline_time(due)
+        if not has_time and now.time() < DATE_ONLY_REMIND_TIME:
+            # 仅日期任务统一等到 09:00，避免凌晨或一开工具就提前弹。
+            return False
+        days_left = (deadline.date() - now.date()).days
+        if before and 1 <= days_left <= int(before_days):
+            return True
+        if on_day and days_left == 0 and (not has_time or deadline <= now):
+            return True
+        if overdue:
+            if has_time and deadline < now:
+                return True
+            if not has_time and days_left < 0:
+                return True
+        return False
+
+    @staticmethod
+    def reminder_status(status, due, enabled, snooze, last_day, now=None,
+                        before=1, on_day=1, overdue=1, before_days=1):
         now = now or datetime.now()
         if status != 'pending':
             return '已结束，不提醒'
@@ -1449,21 +1554,33 @@ class WorkTrackerApp(tk.Tk):
             return '未设截止日期'
         try:
             deadline = WorkTrackerApp.parse_deadline(due)
-            due_day = deadline.date()
             if snooze:
                 until = datetime.fromisoformat(snooze)
                 return f'延后至 {until:%Y.%m.%d %H:%M}' if until > now else '延后已到时，待确认'
+            due_now = WorkTrackerApp.todo_reminder_due(
+                due, before, on_day, overdue, before_days, now
+            )
         except (ValueError, TypeError):
-            return '日期异常，请编辑检查'
+            return '日期或提醒设置异常，请编辑检查'
         if last_day == now.date().isoformat():
             return '今日已确认，明日再提醒'
-        if WorkTrackerApp.has_deadline_time(due):
-            if deadline <= now:
-                return '已到提醒时间，待确认'
-            return '已启用，到设定时间提醒'
-        if (due_day - now.date()).days <= 1:
+        if not WorkTrackerApp.has_deadline_time(due) and now.time() < DATE_ONLY_REMIND_TIME:
+            days_left = (deadline.date() - now.date()).days
+            if days_left == 0:
+                return '今天 09:00 提醒'
+            if days_left > 0:
+                return f'还有 {days_left} 天 · 09:00 提醒'
+            return '已逾期 · 今天 09:00 提醒'
+        if due_now:
             return '已到提醒时间，待确认'
-        return '已启用，提前一天提醒'
+        stages = []
+        if before:
+            stages.append(f'提前 {before_days} 天')
+        if on_day:
+            stages.append('当天')
+        if overdue:
+            stages.append('逾期')
+        return '已启用：' + ' / '.join(stages) if stages else '已启用，但未选择提醒阶段'
 
     @property
     def view_connection(self):
@@ -1846,6 +1963,60 @@ class WorkTrackerApp(tk.Tk):
         self.work_tree.bind('<<TreeviewSelect>>', self.show_work_details)
         self.work_tree.bind('<Double-1>', self.edit_selected_work)
 
+    @staticmethod
+    def _reminder_option_controls(parent, initial=None, on_before_manual=None):
+        """创建新建/编辑共用的到期提醒选项，返回取值与联动方法。"""
+        initial = initial or {}
+        variables = {
+            'enabled': tk.BooleanVar(parent, value=bool(initial.get('enabled', 1))),
+            'before': tk.BooleanVar(parent, value=bool(initial.get('before', 1))),
+            'on_day': tk.BooleanVar(parent, value=bool(initial.get('on_day', 1))),
+            'overdue': tk.BooleanVar(parent, value=bool(initial.get('overdue', 1))),
+            'before_days': tk.StringVar(parent, value=str(initial.get('before_days', 1))),
+        }
+        frame = ttk.Frame(parent)
+        enabled_button = ttk.Checkbutton(frame, text='启用到期提醒', variable=variables['enabled'])
+        enabled_button.grid(row=0, column=0, columnspan=5, sticky='w', pady=(4, 4))
+        before_button = ttk.Checkbutton(frame, text='提前', variable=variables['before'])
+        before_button.grid(row=1, column=0, sticky='w', padx=(18, 4))
+        days_spin = ttk.Spinbox(frame, from_=1, to=365, width=5,
+                                textvariable=variables['before_days'])
+        days_spin.grid(row=1, column=1, sticky='w')
+        days_label = ttk.Label(frame, text='天')
+        days_label.grid(row=1, column=2, sticky='w', padx=(3, 12))
+        on_day_button = ttk.Checkbutton(frame, text='当天', variable=variables['on_day'])
+        on_day_button.grid(row=1, column=3, sticky='w', padx=8)
+        overdue_button = ttk.Checkbutton(frame, text='逾期', variable=variables['overdue'])
+        overdue_button.grid(row=1, column=4, sticky='w', padx=8)
+
+        def sync_state():
+            active = variables['enabled'].get()
+            for widget in (before_button, days_label, on_day_button, overdue_button):
+                widget.configure(state='normal' if active else 'disabled')
+            days_spin.configure(state='normal' if active and variables['before'].get() else 'disabled')
+
+        def before_changed():
+            if on_before_manual is not None:
+                on_before_manual()
+            sync_state()
+
+        enabled_button.configure(command=sync_state)
+        before_button.configure(command=before_changed)
+
+        def get_options():
+            return {key: (value.get() if key != 'before_days' else value.get())
+                    for key, value in variables.items()}
+
+        def set_options(values):
+            for key, variable in variables.items():
+                if key in values:
+                    variable.set(values[key])
+            sync_state()
+
+        sync_state()
+        return {'frame': frame, 'variables': variables, 'get': get_options,
+                'set': set_options, 'sync': sync_state}
+
     def _build_todo_tab(self):
         form = ttk.LabelFrame(self.todo_tab, text='新增待办', padding=12)
         form.pack(fill='x')
@@ -1860,6 +2031,22 @@ class WorkTrackerApp(tk.Tk):
         due_control.grid(row=1, column=2, padx=(0, 12), sticky='ew')
         self.mutation_button(form, text='添加待办', command=self.save_todo).grid(row=1, column=3)
         form.columnconfigure(0, weight=1)
+        self._new_reminder_before_manual = False
+        self.new_reminder_controls = self._reminder_option_controls(
+            form, on_before_manual=lambda: setattr(self, '_new_reminder_before_manual', True)
+        )
+        self.new_reminder_controls['frame'].grid(
+            row=2, column=0, columnspan=4, sticky='w', pady=(4, 0)
+        )
+
+        def sync_new_reminder_default(*args):
+            if not self._new_reminder_before_manual:
+                has_time = bool(self.due_hour.get() or self.due_minute.get())
+                self.new_reminder_controls['variables']['before'].set(not has_time)
+                self.new_reminder_controls['sync']()
+
+        self.due_hour.trace_add('write', sync_new_reminder_default)
+        self.due_minute.trace_add('write', sync_new_reminder_default)
         exports = ttk.Frame(self.todo_tab)
         exports.pack(fill='x', pady=(8, 0))
         ttk.Button(exports, text='导出全部待办 Markdown', command=self.export_todos).pack(side='left')
@@ -2751,7 +2938,8 @@ class WorkTrackerApp(tk.Tk):
                     self.tracker.conn.execute(
                         'INSERT INTO todos (id, task, status, priority, due_date, created_at, '
                         'completed_at, cancel_reason, reminder_enabled, reminder_snooze_until, '
-                        'reminder_last_day) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', row
+                        'reminder_last_day, reminder_before, reminder_on_day, reminder_overdue, '
+                        'reminder_before_days) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', row
                     )
                 self.refresh_todos()
                 self.status.set(f'已撤销删除，待办 [{row[0]}] 已恢复')
@@ -2848,11 +3036,18 @@ class WorkTrackerApp(tk.Tk):
             if not task:
                 raise ValueError('请填写任务描述。')
             due = self.deadline_value(self.due_date, self.due_hour, self.due_minute)
-            self.tracker.add_todo(task, self.PRIORITIES[self.priority.get()], due)
+            options = self.tracker.normalize_reminder_options(
+                due, self.new_reminder_controls['get']()
+            )
+            self.tracker.add_todo(task, self.PRIORITIES[self.priority.get()], due, options)
             self.task.set('')
             self.due_date.set('')
             self.due_hour.set('')
             self.due_minute.set('')
+            self._new_reminder_before_manual = False
+            self.new_reminder_controls['set'](
+                {'enabled': 1, 'before': 1, 'on_day': 1, 'overdue': 1, 'before_days': 1}
+            )
             self.refresh_todos()
             self.status.set('待办已添加')
         except (ValueError, sqlite3.Error) as exc:
@@ -2870,8 +3065,17 @@ class WorkTrackerApp(tk.Tk):
             keyword = self.todo_keyword.get().strip()
             if keyword:
                 clauses.append('task LIKE ?')
+            available_columns = {row[1] for row in self.view_connection.execute('PRAGMA table_info(todos)')}
+            reminder_columns = ', '.join(
+                name if name in available_columns else f'{default} AS {name}'
+                for name, default in (
+                    ('reminder_before', '1'), ('reminder_on_day', '1'),
+                    ('reminder_overdue', '1'), ('reminder_before_days', '1')
+                )
+            )
             sql = ('SELECT id, task, status, priority, due_date, cancel_reason, '
-                   'reminder_enabled, reminder_snooze_until, reminder_last_day FROM todos')
+                   'reminder_enabled, reminder_snooze_until, reminder_last_day, '
+                   + reminder_columns + ' FROM todos')
             params = []
             if clauses:
                 sql += ' WHERE ' + ' AND '.join(clauses)
@@ -2892,7 +3096,8 @@ class WorkTrackerApp(tk.Tk):
             # 一行只取一次时钟：避免每行重复调用系统时间函数。
             now = datetime.now()
             today = now.date()
-            for sequence, (record_id, task, status, priority, due, reason, enabled, snooze, last_day) in enumerate(rows, start=1):
+            for sequence, (record_id, task, status, priority, due, reason, enabled, snooze, last_day,
+                           before, on_day, overdue_enabled, before_days) in enumerate(rows, start=1):
                 try:
                     normalized_due = self.parse_deadline(due) if due else None
                 except ValueError:
@@ -2901,7 +3106,11 @@ class WorkTrackerApp(tk.Tk):
                 tags = (status,) if status in ('completed', 'cancelled') else ('overdue',) if status == 'pending' and overdue else ()
                 self.todo_tree.insert('', 'end', iid=str(record_id), values=(
                     sequence, task, status_names.get(status, status), names.get(priority, priority), self.display_deadline(due) if due else '—',
-                    self.reminder_status(status, due, enabled, snooze, last_day), reason or ''
+                    self.reminder_status(
+                        status, due, enabled, snooze, last_day, now=now,
+                        before=before, on_day=on_day, overdue=overdue_enabled,
+                        before_days=before_days
+                    ), reason or ''
                 ), tags=tags)
             counts = dict(self.view_connection.execute('SELECT status, COUNT(*) FROM todos GROUP BY status').fetchall())
             extra = ''
@@ -3039,7 +3248,8 @@ class WorkTrackerApp(tk.Tk):
             return
         try:
             row = self.tracker.conn.execute(
-                'SELECT task, priority, due_date, status, cancel_reason, completed_at, reminder_enabled FROM todos WHERE id=?', (record_id,)
+                'SELECT task, priority, due_date, status, cancel_reason, completed_at, reminder_enabled, '
+                'reminder_before, reminder_on_day, reminder_overdue, reminder_before_days FROM todos WHERE id=?', (record_id,)
             ).fetchone()
         except sqlite3.Error as exc:
             self.show_message('读取失败', str(exc), parent=self)
@@ -3084,10 +3294,11 @@ class WorkTrackerApp(tk.Tk):
 
         status.trace_add('write', update_reason_state)
         update_reason_state()
-        reminder_enabled = tk.BooleanVar(window, value=bool(row[6]))
-        ttk.Checkbutton(content, text='启用到期提醒（提前一天、当天和逾期）', variable=reminder_enabled).grid(
-            row=6, column=0, columnspan=2, sticky='w', pady=8
-        )
+        reminder_controls = self._reminder_option_controls(content, {
+            'enabled': row[6], 'before': row[7], 'on_day': row[8],
+            'overdue': row[9], 'before_days': row[10]
+        })
+        reminder_controls['frame'].grid(row=6, column=0, columnspan=2, sticky='w', pady=8)
         reset_reminder = tk.BooleanVar(window, value=False)
         ttk.Checkbutton(content, text='清除今日确认 / 稍后提醒记录，重新检查提醒', variable=reset_reminder).grid(
             row=7, column=0, columnspan=2, sticky='w', pady=4
@@ -3102,6 +3313,9 @@ class WorkTrackerApp(tk.Tk):
                 new_status = self.STATUSES[status.get()]
                 completed_at = (row[5] if row[3] == 'completed' and row[5] else datetime.now().isoformat()) if new_status == 'completed' else None
                 cancel_reason = reason.get().strip() if new_status == 'cancelled' else ''
+                options = self.tracker.normalize_reminder_options(
+                    due_date, reminder_controls['get']()
+                )
                 with self.tracker.conn:
                     result = self.tracker.conn.execute(
                         'UPDATE todos SET task=?, priority=?, due_date=?, status=?, cancel_reason=?, completed_at=? WHERE id=?',
@@ -3109,12 +3323,18 @@ class WorkTrackerApp(tk.Tk):
                     )
                     if result.rowcount == 0:
                         raise ValueError('该任务已不存在，无法保存。')
-                    reset = reset_reminder.get() or due_date != row[2] or new_status != row[3] or bool(row[6]) != reminder_enabled.get()
+                    old_options = (bool(row[6]), bool(row[7]), bool(row[8]), bool(row[9]), int(row[10]))
+                    new_options = (options['enabled'], options['before'], options['on_day'],
+                                   options['overdue'], options['before_days'])
+                    reset = (reset_reminder.get() or due_date != row[2] or new_status != row[3]
+                             or old_options != new_options)
                     self.tracker.conn.execute(
-                        'UPDATE todos SET reminder_enabled=?, '
+                        'UPDATE todos SET reminder_enabled=?, reminder_before=?, reminder_on_day=?, '
+                        'reminder_overdue=?, reminder_before_days=?, '
                         'reminder_snooze_until=CASE WHEN ? THEN NULL ELSE reminder_snooze_until END, '
                         'reminder_last_day=CASE WHEN ? THEN NULL ELSE reminder_last_day END WHERE id=?',
-                        (int(reminder_enabled.get()), reset, reset, record_id)
+                        (options['enabled'], options['before'], options['on_day'], options['overdue'],
+                         options['before_days'], reset, reset, record_id)
                     )
             except (ValueError, sqlite3.Error) as exc:
                 self.show_message('保存失败', str(exc), parent=window)
@@ -3204,7 +3424,8 @@ class WorkTrackerApp(tk.Tk):
         try:
             snapshot = self.tracker.conn.execute(
                 'SELECT id, task, status, priority, due_date, created_at, completed_at, '
-                'cancel_reason, reminder_enabled, reminder_snooze_until, reminder_last_day '
+                'cancel_reason, reminder_enabled, reminder_snooze_until, reminder_last_day, '
+                'reminder_before, reminder_on_day, reminder_overdue, reminder_before_days '
                 'FROM todos WHERE id=?', (record_id,)
             ).fetchone()
             deleted = self.tracker.delete_todo(record_id)
@@ -3372,12 +3593,16 @@ class WorkTrackerApp(tk.Tk):
                 _, record_id, task, due = r
                 deadline = self.parse_deadline(due)
                 days = (deadline.date() - today).days
-                if self.has_deadline_time(due):
+                if days > 0:
+                    timing = '明天到期' if days == 1 else f'还有 {days} 天到期'
+                elif days < 0:
+                    timing = f'已逾期 {-days} 天'
+                elif self.has_deadline_time(due):
                     delta = deadline - datetime.now()
                     count = max(1, math.ceil(abs(delta.total_seconds()) / 60))
                     timing = f'已逾期 {count} 分钟' if delta.total_seconds() < 0 else f'距截止 {count} 分钟'
                 else:
-                    timing = '明天到期' if days == 1 else '今天到期' if days == 0 else f'已逾期 {-days} 天'
+                    timing = '今天到期'
                 text.insert('end', '【待办到期】', 'todo_tag')
                 text.insert('end', task.strip() + '\n')
                 text.insert('end', f'   {timing}  ·  截止 {self.display_deadline(due)}', 'meta_tag')
