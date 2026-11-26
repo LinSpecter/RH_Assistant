@@ -7,6 +7,8 @@ RH 每日工作记录
     数据备份与独立归档，并可通过系统托盘持续提醒。
 
 版本记录：
+    v1.3  2026.11.26
+        - 修复任务栏按钮仍显示 Tk 默认图标的问题
     v1.2  2026.11.26
         - 仅写日期的待办统一 09:00 后提醒，提前/当天/逾期均适用
         - 循环提醒按设定时间到点才弹，错过日期后打开立即补弹
@@ -40,7 +42,7 @@ from tkinter import ttk, filedialog, font as tkfont
 from datetime import datetime, date, time, timedelta, timezone
 
 
-APP_VERSION = "1.2"
+APP_VERSION = "1.3"
 APP_RELEASE_DATE = "2026.11.26"
 
 # 仅写日期的待办统一在当天 09:00 后提醒。
@@ -68,6 +70,37 @@ def set_app_user_model_id(app_id):
     try:
         import ctypes
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
+    except Exception:
+        pass
+
+
+def apply_windows_taskbar_icon(window, icon_path):
+    """Tk 的 iconphoto 只作用于标题栏；任务栏按钮读取窗口类图标，需直接写入。"""
+    if sys.platform != 'win32' or not icon_path.is_file():
+        return
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        user32.GetAncestor.restype = ctypes.c_void_p
+        user32.LoadImageW.restype = ctypes.c_void_p
+        user32.SetClassLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+        user32.SetClassLongPtrW.restype = ctypes.c_void_p
+        user32.SendMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_void_p]
+        user32.SendMessageW.restype = ctypes.c_void_p
+        hwnd = user32.GetAncestor(window.winfo_id(), 2)  # GA_ROOT
+        if not hwnd:
+            return
+        image_icon, load_from_file, default_size = 1, 0x10, 0x40
+        wm_seticon = 0x0080
+        big_icon = user32.LoadImageW(None, str(icon_path), image_icon, 0, 0, load_from_file | default_size)
+        small_icon = user32.LoadImageW(None, str(icon_path), image_icon, 16, 16, load_from_file)
+        if big_icon:
+            user32.SetClassLongPtrW(hwnd, -14, big_icon)  # GCLP_HICON
+            user32.SendMessageW(hwnd, wm_seticon, 1, big_icon)  # ICON_BIG
+        if small_icon:
+            user32.SetClassLongPtrW(hwnd, -34, small_icon)  # GCLP_HICONSM
+            user32.SendMessageW(hwnd, wm_seticon, 0, small_icon)  # ICON_SMALL
+            user32.SendMessageW(hwnd, wm_seticon, 2, small_icon)  # ICON_SMALL2
     except Exception:
         pass
 
@@ -1122,6 +1155,9 @@ class WorkTrackerApp(tk.Tk):
         # 所以主窗口必须用 False 单独设一次，再用 True 让后续弹窗继承。
         self.iconphoto(False, self._app_icon)
         self.iconphoto(True, self._app_icon)
+        # 任务栏图标改用 RH.ico；打包后从 _MEIPASS 读取。
+        icon_path = Path(getattr(sys, '_MEIPASS', Path(__file__).parent)) / 'RH.ico'
+        self.after(0, lambda: apply_windows_taskbar_icon(self, icon_path))
         # 按屏幕可用区域夹取窗口尺寸，小屏幕或高分屏下底栏也不会被顶出可视区。
         screen_w = max(self.winfo_screenwidth(), 800)
         screen_h = max(self.winfo_screenheight(), 600)
