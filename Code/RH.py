@@ -577,8 +577,11 @@ class WorkTracker:
                 day = deadline.date()
                 if snooze:
                     eligible = datetime.fromisoformat(snooze) <= now
+                elif WorkTrackerApp.has_deadline_time(due):
+                    # 带时分的任务不提前一天，到设定时间才进入提醒范围。
+                    eligible = deadline <= now and last_day != now.date().isoformat()
                 else:
-                    eligible = (deadline - now <= timedelta(days=1) if WorkTrackerApp.has_deadline_time(due) else (day - now.date()).days <= 1) and last_day != now.date().isoformat()
+                    eligible = (day - now.date()).days <= 1 and last_day != now.date().isoformat()
             except (ValueError, TypeError):
                 continue
             if eligible:
@@ -1454,7 +1457,11 @@ class WorkTrackerApp(tk.Tk):
             return '日期异常，请编辑检查'
         if last_day == now.date().isoformat():
             return '今日已确认，明日再提醒'
-        if (deadline - now <= timedelta(days=1) if WorkTrackerApp.has_deadline_time(due) else (due_day - now.date()).days <= 1):
+        if WorkTrackerApp.has_deadline_time(due):
+            if deadline <= now:
+                return '已到提醒时间，待确认'
+            return '已启用，到设定时间提醒'
+        if (due_day - now.date()).days <= 1:
             return '已到提醒时间，待确认'
         return '已启用，提前一天提醒'
 
